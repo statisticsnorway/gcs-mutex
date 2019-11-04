@@ -20,50 +20,55 @@ public class GCSMutexTest {
     Storage storage;
     String bucket;
     BlobId blobId;
+    GCSMutex mutex;
 
     @BeforeMethod
     public void setup() {
-        bucket = ofNullable(System.getenv("GCS_MUTEX_BUCKET")).orElse("dev-datalager-store");
-        blobId = BlobId.of(bucket, GCS_MUTEX_PATH);
         Path pathToGcsSaKeyFile = Path.of(ofNullable(System.getenv("GCS_MUTEX_SERVICE_ACCOUNT_KEY_FILE")).orElse("secret/gcs_sa.json"));
         storage = GCSMutex.storageFrom(pathToGcsSaKeyFile);
-        storage.delete(blobId);
+        bucket = ofNullable(System.getenv("GCS_MUTEX_BUCKET")).orElse("kcg-experimental-bucket");
+        blobId = BlobId.of(bucket, GCS_MUTEX_PATH);
+        mutex = GCSMutex.create(storage, blobId);
+        mutex.unlock(); // ensure unlocked
     }
 
     @Test
     public void testLock() {
-        GCSMutex mutex = GCSMutex.create(storage, blobId, Duration.ofSeconds(10));
         mutex.lock();
         assertFalse(mutex.tryLock());
     }
 
     @Test
     public void testLockInterruptibly() throws InterruptedException {
-        GCSMutex mutex = GCSMutex.create(storage, blobId, Duration.ofSeconds(10));
         mutex.lockInterruptibly();
         assertFalse(mutex.tryLock());
     }
 
     @Test
     public void testTryLock() {
-        GCSMutex mutex = GCSMutex.create(storage, blobId, Duration.ofSeconds(10));
         assertTrue(mutex.tryLock());
         assertFalse(mutex.tryLock());
     }
 
     @Test
     public void testTryLockTimeout() throws InterruptedException {
-        GCSMutex mutex = GCSMutex.create(storage, blobId, Duration.ofSeconds(10));
         assertTrue(mutex.tryLock(5, TimeUnit.SECONDS));
         assertFalse(mutex.tryLock(100, TimeUnit.MILLISECONDS));
     }
 
     @Test
     public void testUnlock() {
-        GCSMutex mutex = GCSMutex.create(storage, blobId, Duration.ofSeconds(10));
         assertTrue(mutex.tryLock());
         assertFalse(mutex.tryLock());
         mutex.unlock();
         assertTrue(mutex.tryLock());
+    }
+
+    @Test
+    public void thatTimeToLiveWorks() throws InterruptedException {
+        GCSMutex mutex = GCSMutex.create(storage, blobId, Duration.ofMillis(10));
+        assertTrue(mutex.tryLock());
+        Thread.sleep(500);
+        assertTrue(mutex.tryLock()); // should be allowed because the ttl of 10 milliseconds should now have expired
     }
 }
