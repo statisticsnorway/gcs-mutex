@@ -50,24 +50,24 @@ public class GCSMetadataMutex implements Lock {
         return new GCSMetadataMutex(storage, mutexBlobId, timeToLive, backoffRandom, maximumBackoff);
     }
 
-    public static GCSMetadataMutex create(Path serviceAccountKeyPath, String bucket, String path) {
+    public static GCSMetadataMutex create(Path serviceAccountKeyPath, String bucket, String path) throws GCSMutexException {
         return new GCSMetadataMutex(storageFrom(serviceAccountKeyPath), BlobId.of(bucket, path), Duration.ofMinutes(1), new Random(), Duration.ofSeconds(64));
     }
 
-    public static GCSMetadataMutex create(Path serviceAccountKeyPath, String bucket, String path, Duration timeToLive) {
+    public static GCSMetadataMutex create(Path serviceAccountKeyPath, String bucket, String path, Duration timeToLive) throws GCSMutexException {
         return new GCSMetadataMutex(storageFrom(serviceAccountKeyPath), BlobId.of(bucket, path), timeToLive, new Random(), Duration.ofSeconds(64));
     }
 
-    public static GCSMetadataMutex create(Path serviceAccountKeyPath, String bucket, String path, Duration timeToLive, Random backoffRandom, Duration maximumBackoff) {
+    public static GCSMetadataMutex create(Path serviceAccountKeyPath, String bucket, String path, Duration timeToLive, Random backoffRandom, Duration maximumBackoff) throws GCSMutexException {
         return new GCSMetadataMutex(storageFrom(serviceAccountKeyPath), BlobId.of(bucket, path), timeToLive, backoffRandom, maximumBackoff);
     }
 
-    public static Storage storageFrom(Path serviceAccountKeyPath) {
+    public static Storage storageFrom(Path serviceAccountKeyPath) throws GCSMutexException {
         ServiceAccountCredentials sourceCredentials;
         try {
             sourceCredentials = ServiceAccountCredentials.fromStream(Files.newInputStream(serviceAccountKeyPath, StandardOpenOption.READ));
         } catch (IOException e) {
-            throw new RuntimeException(e);
+            throw new GCSMutexException(e);
         }
         GoogleCredentials scopedCredentials = sourceCredentials.createScoped(Arrays.asList("https://www.googleapis.com/auth/devstorage.full_control"));
         Storage storage = StorageOptions.newBuilder().setCredentials(scopedCredentials).build().getService();
@@ -92,7 +92,7 @@ public class GCSMetadataMutex implements Lock {
         return Math.min(1000L * (1 << Math.min(i, 8)), maximumBackoff.toMillis()) + backoffRandom.nextInt(1001);
     }
 
-    boolean tryAcquire() {
+    boolean tryAcquire() throws GCSMutexException {
         Blob blob = storage.get(mutexBlobId);
         if (blob == null) {
             return acquireByCreatingFileIfDoesNotExist();
@@ -122,7 +122,7 @@ public class GCSMetadataMutex implements Lock {
         return false;
     }
 
-    boolean acquireThroughMetadataUpdate(Blob blob) {
+    boolean acquireThroughMetadataUpdate(Blob blob) throws GCSMutexException {
         String uuid = UUID.randomUUID().toString();
         Map<String, String> m = Map.of(
                 "uuid", uuid,
@@ -147,7 +147,7 @@ public class GCSMetadataMutex implements Lock {
         }
     }
 
-    boolean acquireByCreatingFileIfDoesNotExist() {
+    boolean acquireByCreatingFileIfDoesNotExist() throws GCSMutexException {
         // lock-file does not exist
         String uuid = UUID.randomUUID().toString();
         Map<String, String> metadata = Map.of(
@@ -173,7 +173,7 @@ public class GCSMetadataMutex implements Lock {
     }
 
     @Override
-    public void lock() {
+    public void lock() throws GCSMutexException {
         LOG.trace("lock()");
         for (long i = 0; ; i++) {
             if (tryAcquire()) {
@@ -185,14 +185,14 @@ public class GCSMetadataMutex implements Lock {
                     Thread.sleep(waitTimeMs);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt(); // preserve interrupt status
-                    throw new RuntimeException(e);
+                    throw new GCSMutexException(e);
                 }
             }
         }
     }
 
     @Override
-    public void lockInterruptibly() throws InterruptedException {
+    public void lockInterruptibly() throws InterruptedException, GCSMutexException  {
         LOG.trace("lockInterruptibly()");
         for (long i = 0; ; i++) {
             if (tryAcquire()) {
@@ -206,13 +206,13 @@ public class GCSMetadataMutex implements Lock {
     }
 
     @Override
-    public boolean tryLock() {
+    public boolean tryLock() throws GCSMutexException {
         LOG.trace("tryLock()");
         return tryAcquire();
     }
 
     @Override
-    public boolean tryLock(long time, TimeUnit unit) throws InterruptedException {
+    public boolean tryLock(long time, TimeUnit unit) throws InterruptedException, GCSMutexException  {
         LOG.trace("tryLock({}, {})", time, unit);
         long start = System.currentTimeMillis();
         for (long i = 0; ; i++) {
@@ -233,7 +233,7 @@ public class GCSMetadataMutex implements Lock {
     }
 
     @Override
-    public void unlock() {
+    public void unlock() throws GCSMutexException {
         LOG.trace("unlock()");
         Blob blob = storage.get(mutexBlobId);
         if (blob == null) {

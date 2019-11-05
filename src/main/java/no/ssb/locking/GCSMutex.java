@@ -20,7 +20,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
-import java.util.*;
+import java.util.Collections;
+import java.util.Map;
+import java.util.Random;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
@@ -52,24 +55,24 @@ public class GCSMutex implements Lock {
         return new GCSMutex(storage, mutexBlobId, timeToLive, backoffRandom, maximumBackoff);
     }
 
-    public static GCSMutex create(Path serviceAccountKeyPath, String bucket, String path) {
+    public static GCSMutex create(Path serviceAccountKeyPath, String bucket, String path) throws GCSMutexException {
         return new GCSMutex(storageFrom(serviceAccountKeyPath), BlobId.of(bucket, path), Duration.ofMinutes(1), new Random(), Duration.ofSeconds(64));
     }
 
-    public static GCSMutex create(Path serviceAccountKeyPath, String bucket, String path, Duration timeToLive) {
+    public static GCSMutex create(Path serviceAccountKeyPath, String bucket, String path, Duration timeToLive) throws GCSMutexException {
         return new GCSMutex(storageFrom(serviceAccountKeyPath), BlobId.of(bucket, path), timeToLive, new Random(), Duration.ofSeconds(64));
     }
 
-    public static GCSMutex create(Path serviceAccountKeyPath, String bucket, String path, Duration timeToLive, Random backoffRandom, Duration maximumBackoff) {
+    public static GCSMutex create(Path serviceAccountKeyPath, String bucket, String path, Duration timeToLive, Random backoffRandom, Duration maximumBackoff) throws GCSMutexException {
         return new GCSMutex(storageFrom(serviceAccountKeyPath), BlobId.of(bucket, path), timeToLive, backoffRandom, maximumBackoff);
     }
 
-    public static Storage storageFrom(Path serviceAccountKeyPath) {
+    public static Storage storageFrom(Path serviceAccountKeyPath) throws GCSMutexException {
         ServiceAccountCredentials sourceCredentials;
         try {
             sourceCredentials = ServiceAccountCredentials.fromStream(Files.newInputStream(serviceAccountKeyPath, StandardOpenOption.READ));
         } catch (IOException e) {
-            throw new RuntimeException(e);
+            throw new GCSMutexException(e);
         }
         GoogleCredentials scopedCredentials = sourceCredentials.createScoped(Collections.singletonList("https://www.googleapis.com/auth/devstorage.read_write"));
         Storage storage = StorageOptions.newBuilder().setCredentials(scopedCredentials).build().getService();
@@ -94,7 +97,7 @@ public class GCSMutex implements Lock {
         return Math.min(1000 * (1L << Math.min(i, 8)), maximumBackoff.toMillis()) + backoffRandom.nextInt(1001);
     }
 
-    boolean tryAcquire() {
+    boolean tryAcquire() throws GCSMutexException {
         Blob blob = storage.get(mutexBlobId);
         if (blob == null) {
             return acquireByCreatingFileIfDoesNotExist(UUID.randomUUID().toString(), "locked", timeToLive.toMillis());
@@ -110,7 +113,7 @@ public class GCSMutex implements Lock {
                 Thread.sleep(100); // avoid excessive cpu usage when socket read is not yet ready
             }
         } catch (IOException | InterruptedException e) {
-            throw new RuntimeException(e);
+            throw new GCSMutexException(e);
         }
         Pattern pattern = Pattern.compile("\\s*([^\\s:]+):\\s*([^\\s]*)\\s*");
         Map<String, String> contentMap = new String(array, StandardCharsets.UTF_8).lines().collect(Collectors.toMap(
@@ -157,7 +160,7 @@ public class GCSMutex implements Lock {
         return false;
     }
 
-    boolean updateMutexThroughDataOverwrite(Blob blob, String uuid, String status, long ttlMs) {
+    boolean updateMutexThroughDataOverwrite(Blob blob, String uuid, String status, long ttlMs) throws GCSMutexException {
         try {
             writeBytesToBlobIfGenerationMatch(blob, uuid, status, ttlMs);
             LOG.trace("Lock acquired. UUID: {}", uuid);
@@ -173,7 +176,7 @@ public class GCSMutex implements Lock {
         }
     }
 
-    void writeBytesToBlobIfGenerationMatch(Blob blob, String uuid, String status, long ttlMs) {
+    void writeBytesToBlobIfGenerationMatch(Blob blob, String uuid, String status, long ttlMs) throws GCSMutexException {
         StringBuilder sb = new StringBuilder();
         sb.append("uuid: ").append(uuid).append("\n");
         sb.append("status: ").append(status).append("\n");
@@ -184,7 +187,7 @@ public class GCSMutex implements Lock {
             int i = 0;
             while (bb.hasRemaining()) {
                 if (i >= 25) {
-                    throw new RuntimeException("Unable to write data to GCS object after 25 attempts");
+                    throw new GCSMutexException("Unable to write data to GCS object after 25 attempts");
                 }
                 if ((i + 1) % 2 == 0) {
                     // avoid excessive cpu usage while retrying socket write
@@ -192,18 +195,18 @@ public class GCSMutex implements Lock {
                         Thread.sleep(1000);
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt(); // preserve interrupt status
-                        throw new RuntimeException(e);
+                        throw new GCSMutexException(e);
                     }
                 }
                 int n = ch.write(bb);
                 i++;
             }
         } catch (IOException e) {
-            throw new RuntimeException(e);
+            throw new GCSMutexException(e);
         }
     }
 
-    boolean acquireByCreatingFileIfDoesNotExist(String uuid, String status, long ttlMs) {
+    boolean acquireByCreatingFileIfDoesNotExist(String uuid, String status, long ttlMs) throws GCSMutexException {
         // lock-file does not exist
         StringBuilder sb = new StringBuilder();
         sb.append("uuid: ").append(uuid).append("\n");
@@ -228,7 +231,7 @@ public class GCSMutex implements Lock {
     }
 
     @Override
-    public void lock() {
+    public void lock() throws GCSMutexException {
         LOG.trace("lock()");
         for (long i = 0; ; i++) {
             if (tryAcquire()) {
@@ -240,14 +243,14 @@ public class GCSMutex implements Lock {
                     Thread.sleep(waitTimeMs);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt(); // preserve interrupt status
-                    throw new RuntimeException(e);
+                    throw new GCSMutexException(e);
                 }
             }
         }
     }
 
     @Override
-    public void lockInterruptibly() throws InterruptedException {
+    public void lockInterruptibly() throws InterruptedException, GCSMutexException {
         LOG.trace("lockInterruptibly()");
         for (long i = 0; ; i++) {
             if (tryAcquire()) {
@@ -261,13 +264,13 @@ public class GCSMutex implements Lock {
     }
 
     @Override
-    public boolean tryLock() {
+    public boolean tryLock() throws GCSMutexException {
         LOG.trace("tryLock()");
         return tryAcquire();
     }
 
     @Override
-    public boolean tryLock(long time, TimeUnit unit) throws InterruptedException {
+    public boolean tryLock(long time, TimeUnit unit) throws InterruptedException, GCSMutexException {
         LOG.trace("tryLock({}, {})", time, unit);
         long start = System.currentTimeMillis();
         for (long i = 0; ; i++) {
@@ -288,7 +291,7 @@ public class GCSMutex implements Lock {
     }
 
     @Override
-    public void unlock() {
+    public void unlock() throws GCSMutexException {
         LOG.trace("unlock()");
         Blob blob = storage.get(mutexBlobId);
         if (blob == null) {
