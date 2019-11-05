@@ -25,7 +25,7 @@ public class GCSMetadataMutexTest {
     public void setup() {
         Path pathToGcsSaKeyFile = Path.of(ofNullable(System.getenv("GCS_MUTEX_SERVICE_ACCOUNT_KEY_FILE")).orElse("secret/gcs_sa.json"));
         storage = GCSMetadataMutex.storageFrom(pathToGcsSaKeyFile);
-        bucket = ofNullable(System.getenv("GCS_MUTEX_BUCKET")).orElse("kcg-experimental-bucket");
+        bucket = ofNullable(System.getenv("GCS_MUTEX_BUCKET")).orElse("dev-datalager-store");
         blobId = BlobId.of(bucket, "testng/mutex-" + UUID.randomUUID().toString() + ".dat");
         mutex = GCSMetadataMutex.create(storage, blobId);
     }
