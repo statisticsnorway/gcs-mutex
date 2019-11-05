@@ -4,7 +4,7 @@
 
     <groupId>no.ssb.locking</groupId>
     <artifactId>gcs-mutex</artifactId>
-    <version>0.1-SNAPSHOT</version>
+    <version>0.1</version>
     <packaging>jar</packaging>
 
     <name>GCS Mutex</name>
@@ -39,7 +39,7 @@
         <developerConnection>scm:git:git@github.com:statisticsnorway/gcs-mutex.git
         </developerConnection>
         <url>https://github.com/statisticsnorway/gcs-mutex/tree/master</url>
-        <tag>HEAD</tag>
+        <tag>gcs-mutex-0.1</tag>
     </scm>
 
     <distributionManagement>
