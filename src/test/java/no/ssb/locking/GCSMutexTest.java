@@ -1,14 +1,22 @@
 package no.ssb.locking;
 
+import com.google.api.gax.paging.Page;
+import com.google.cloud.storage.Blob;
 import com.google.cloud.storage.BlobId;
+import com.google.cloud.storage.BlobInfo;
 import com.google.cloud.storage.Storage;
+import org.testng.annotations.AfterClass;
+import org.testng.annotations.BeforeClass;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
 import static java.util.Optional.ofNullable;
 import static org.testng.Assert.assertFalse;
@@ -18,15 +26,38 @@ public class GCSMutexTest {
 
     Storage storage;
     String bucket;
+    String prefix;
+
     BlobId blobId;
     GCSMutex mutex;
 
-    @BeforeMethod
-    public void setup() {
+    @BeforeClass
+    public void beforeClass() {
         Path pathToGcsSaKeyFile = Path.of(ofNullable(System.getenv("GCS_MUTEX_SERVICE_ACCOUNT_KEY_FILE")).orElse("secret/gcs_sa.json"));
         storage = GCSMutex.storageFrom(pathToGcsSaKeyFile);
         bucket = ofNullable(System.getenv("GCS_MUTEX_BUCKET")).orElse("bip-drone-dependency-cache");
-        blobId = BlobId.of(bucket, "testng/mutex-" + UUID.randomUUID().toString() + ".dat");
+        prefix = "testng-" + UUID.randomUUID().toString();
+        clearBucketFolder();
+    }
+
+    @AfterClass
+    public void clearBucketFolder() {
+        Page<Blob> page = storage.list(bucket, Storage.BlobListOption.prefix(prefix + "/"));
+        BlobId[] blobs = StreamSupport.stream(page.iterateAll().spliterator(), false).map(BlobInfo::getBlobId).collect(Collectors.toList()).toArray(new BlobId[0]);
+        if (blobs.length > 0) {
+            List<Boolean> deletedList = storage.delete(blobs);
+            for (Boolean deleted : deletedList) {
+                if (!deleted) {
+                    throw new RuntimeException("Unable to delete blob in bucket");
+                }
+            }
+        }
+    }
+
+
+    @BeforeMethod
+    public void setup() {
+        blobId = BlobId.of(bucket, prefix + "/mutex-" + UUID.randomUUID().toString() + ".dat");
         mutex = GCSMutex.create(storage, blobId);
     }
 
