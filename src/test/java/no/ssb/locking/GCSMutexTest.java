@@ -7,6 +7,7 @@ import org.testng.annotations.Test;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import static java.util.Optional.ofNullable;
@@ -14,8 +15,6 @@ import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
 
 public class GCSMutexTest {
-
-    static final String GCS_MUTEX_PATH = "testng/mutex-" + (int) (100000 * Math.random()) + ".dat";
 
     Storage storage;
     String bucket;
@@ -27,9 +26,8 @@ public class GCSMutexTest {
         Path pathToGcsSaKeyFile = Path.of(ofNullable(System.getenv("GCS_MUTEX_SERVICE_ACCOUNT_KEY_FILE")).orElse("secret/gcs_sa.json"));
         storage = GCSMutex.storageFrom(pathToGcsSaKeyFile);
         bucket = ofNullable(System.getenv("GCS_MUTEX_BUCKET")).orElse("kcg-experimental-bucket");
-        blobId = BlobId.of(bucket, GCS_MUTEX_PATH);
+        blobId = BlobId.of(bucket, "testng/mutex-" + UUID.randomUUID().toString() + ".dat");
         mutex = GCSMutex.create(storage, blobId);
-        mutex.unlock(); // ensure unlocked
     }
 
     @Test
@@ -52,21 +50,26 @@ public class GCSMutexTest {
 
     @Test
     public void testTryLockTimeout() throws InterruptedException {
-        assertTrue(mutex.tryLock(5, TimeUnit.SECONDS));
-        assertFalse(mutex.tryLock(100, TimeUnit.MILLISECONDS));
+        assertTrue(mutex.tryLock(30, TimeUnit.SECONDS));
+        assertFalse(mutex.tryLock(10, TimeUnit.MILLISECONDS));
     }
 
     @Test
     public void testUnlock() {
         assertTrue(mutex.tryLock());
-        assertFalse(mutex.tryLock());
+        mutex.unlock();
+        assertTrue(mutex.tryLock());
+    }
+
+    @Test
+    public void testUnlockAsFirstOperation() {
         mutex.unlock();
         assertTrue(mutex.tryLock());
     }
 
     @Test
     public void thatTimeToLiveWorks() throws InterruptedException {
-        GCSMutex mutex = GCSMutex.create(storage, blobId, Duration.ofMillis(10));
+        GCSMutex mutex = GCSMutex.create(storage, blobId, Duration.ofMillis(10)); // use shorter ttl
         assertTrue(mutex.tryLock());
         Thread.sleep(500);
         assertTrue(mutex.tryLock()); // should be allowed because the ttl of 10 milliseconds should now have expired
