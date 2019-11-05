@@ -95,13 +95,13 @@ public class GCSMetadataMutex implements Lock {
     boolean tryAcquire() throws GCSMutexException {
         Blob blob = storage.get(mutexBlobId);
         if (blob == null) {
-            return acquireByCreatingFileIfDoesNotExist();
+            return acquireByCreatingFileIfDoesNotExist(UUID.randomUUID().toString(), "locked", timeToLive.toMillis());
         }
         Map<String, String> metadata = blob.getMetadata();
         String status = metadata.get("status");
         if (!"locked".equalsIgnoreCase(status)) {
             LOG.trace("Mutex available, attempting to acquire lock...");
-            return acquireThroughMetadataUpdate(blob);
+            return acquireThroughMetadataUpdate(blob, UUID.randomUUID().toString(), "locked", timeToLive.toMillis());
         }
 
         // already locked check whether lock has expired according to its defined ttl
@@ -116,18 +116,17 @@ public class GCSMetadataMutex implements Lock {
         long expiredDuration = System.currentTimeMillis() - expiry;
         if (expiredDuration >= 0) {
             LOG.trace("Mutex expired, attempting to acquire lock...");
-            return acquireThroughMetadataUpdate(blob);
+            return acquireThroughMetadataUpdate(blob, UUID.randomUUID().toString(), "locked", timeToLive.toMillis());
         }
         LOG.trace("Failed to acquire lock, already held by someone else with uuid: {} and ttl: {}", metadata.get("uuid"), metadata.get("time-to-live"));
         return false;
     }
 
-    boolean acquireThroughMetadataUpdate(Blob blob) throws GCSMutexException {
-        String uuid = UUID.randomUUID().toString();
+    boolean acquireThroughMetadataUpdate(BlobInfo blob, String uuid, String status, long ttlMs) throws GCSMutexException {
         Map<String, String> m = Map.of(
                 "uuid", uuid,
-                "status", "locked",
-                "time-to-live", String.valueOf(timeToLive.toMillis())
+                "status", status,
+                "time-to-live", String.valueOf(ttlMs)
         );
         try {
             storage.update(blob.toBuilder().setMetadata(m).build(),
@@ -137,8 +136,7 @@ public class GCSMetadataMutex implements Lock {
             LOG.trace("Lock acquired. UUID: {}", uuid);
             return true;
         } catch (StorageException e) {
-            if ("Precondition Failed".equals(e.getMessage())
-                    && "conditionNotMet".equals(e.getReason())) {
+            if (e.getCode() == 412) {
                 LOG.trace("Failed to acquire lock, lost race to another competing process");
                 return false;
             } else {
@@ -147,13 +145,12 @@ public class GCSMetadataMutex implements Lock {
         }
     }
 
-    boolean acquireByCreatingFileIfDoesNotExist() throws GCSMutexException {
+    boolean acquireByCreatingFileIfDoesNotExist(String uuid, String status, long ttlMs) throws GCSMutexException {
         // lock-file does not exist
-        String uuid = UUID.randomUUID().toString();
         Map<String, String> metadata = Map.of(
                 "uuid", uuid,
-                "status", "locked",
-                "time-to-live", String.valueOf(timeToLive.toMillis())
+                "status", status,
+                "time-to-live", String.valueOf(ttlMs)
         );
         try {
             storage.create(BlobInfo.newBuilder(mutexBlobId).setMetadata(metadata).build(),
@@ -162,8 +159,7 @@ public class GCSMetadataMutex implements Lock {
             LOG.trace("Lock acquired. UUID: {}", uuid);
             return true;
         } catch (StorageException e) {
-            if ("Precondition Failed".equals(e.getMessage())
-                    && "conditionNotMet".equals(e.getReason())) {
+            if (e.getCode() == 412) {
                 LOG.trace("lost creation race to another parallel process");
                 return false;
             } else {
@@ -192,7 +188,7 @@ public class GCSMetadataMutex implements Lock {
     }
 
     @Override
-    public void lockInterruptibly() throws InterruptedException, GCSMutexException  {
+    public void lockInterruptibly() throws InterruptedException, GCSMutexException {
         LOG.trace("lockInterruptibly()");
         for (long i = 0; ; i++) {
             if (tryAcquire()) {
@@ -212,7 +208,7 @@ public class GCSMetadataMutex implements Lock {
     }
 
     @Override
-    public boolean tryLock(long time, TimeUnit unit) throws InterruptedException, GCSMutexException  {
+    public boolean tryLock(long time, TimeUnit unit) throws InterruptedException, GCSMutexException {
         LOG.trace("tryLock({}, {})", time, unit);
         long start = System.currentTimeMillis();
         for (long i = 0; ; i++) {

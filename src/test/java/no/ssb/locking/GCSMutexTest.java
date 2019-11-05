@@ -13,6 +13,7 @@ import org.testng.annotations.Test;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -99,10 +100,38 @@ public class GCSMutexTest {
     }
 
     @Test
-    public void thatTimeToLiveWorks() throws InterruptedException {
+    public void thatAcquireByCreatingFileIfDoesNotExistWorksBothWhenFileDoesNotExistsAndWhenItDoesExists() {
+        assertTrue(mutex.acquireByCreatingFileIfDoesNotExist(UUID.randomUUID().toString(), "custom-test-status", 12345));
+        // file now exists, the second attempt to create file should fail
+        assertFalse(mutex.acquireByCreatingFileIfDoesNotExist(UUID.randomUUID().toString(), "custom-test-status-2", 54321));
+    }
+
+    @Test
+    public void thatUpdateMutexThroughDataOverwriteWorksBothWhenGenerationMatchesAndWhenNot() {
+        Blob blob = storage.create(BlobInfo.newBuilder(blobId).build()); // create empty file, should now be generation 1
+        assertTrue(mutex.updateMutexThroughDataOverwrite(blob, UUID.randomUUID().toString(), "custom", 12345));
+        assertFalse(mutex.updateMutexThroughDataOverwrite(blob, UUID.randomUUID().toString(), "custom2", 54321)); // fails because generation is now 2
+    }
+
+    @Test
+    public void thatReadMutexContentWorksForNewlyCreatedLock() {
+        assertTrue(mutex.tryAcquire());
+        Map<String, String> map = mutex.readMutexContent(storage.get(blobId));
+        assertTrue(map.containsKey("status"));
+        assertTrue(map.containsKey("uuid"));
+        assertTrue(map.containsKey("time-to-live"));
+    }
+
+    @Test
+    public void thatTryAcquireWillGetLockWhenNoLockfileExists() {
+        assertTrue(mutex.tryAcquire());
+    }
+
+    @Test
+    public void thatTryAcquireWillGetLockWhenExistingLockfileIsExpired() throws InterruptedException {
         GCSMutex mutex = GCSMutex.create(storage, blobId, Duration.ofMillis(10)); // use shorter ttl
-        assertTrue(mutex.tryLock());
+        assertTrue(mutex.tryAcquire());
         Thread.sleep(500);
-        assertTrue(mutex.tryLock()); // should be allowed because the ttl of 10 milliseconds should now have expired
+        assertTrue(mutex.tryAcquire()); // should be allowed because the ttl of 10 milliseconds should now have expired
     }
 }

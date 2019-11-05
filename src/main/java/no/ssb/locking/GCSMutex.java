@@ -102,48 +102,18 @@ public class GCSMutex implements Lock {
         if (blob == null) {
             return acquireByCreatingFileIfDoesNotExist(UUID.randomUUID().toString(), "locked", timeToLive.toMillis());
         }
-        if (blob.getSize() > 1024) {
-            throw new IllegalStateException(String.format("blob size > 1024 bytes; blobId %s", blob.getBlobId()));
-        }
-        byte[] array = new byte[blob.getSize().intValue()];
-        try (ReadChannel reader = blob.reader()) {
-            ByteBuffer bb = ByteBuffer.wrap(array);
-            int n;
-            while ((n = reader.read(bb)) != -1) {
-                Thread.sleep(100); // avoid excessive cpu usage when socket read is not yet ready
-            }
-        } catch (IOException | InterruptedException e) {
-            throw new GCSMutexException(e);
-        }
-        Pattern pattern = Pattern.compile("\\s*([^\\s:]+):\\s*([^\\s]*)\\s*");
-        Map<String, String> contentMap = new String(array, StandardCharsets.UTF_8).lines().collect(Collectors.toMap(
-                line -> {
-                    Matcher m = pattern.matcher(line);
-                    if (!m.matches()) {
-                        throw new IllegalStateException("Line does not match pattern. Line: " + line);
-                    }
-                    return m.group(1);
-                },
-                line -> {
-                    Matcher m = pattern.matcher(line);
-                    if (!m.matches()) {
-                        throw new IllegalStateException("Line does not match pattern. Line: " + line);
-                    }
-                    return m.group(2);
-                }
-                )
-        );
+        Map<String, String> content = readMutexContent(blob);
 
-        String status = contentMap.get("status");
+        String status = content.get("status");
         if (!"locked".equalsIgnoreCase(status)) {
             LOG.trace("Mutex available, attempting to acquire lock...");
             return updateMutexThroughDataOverwrite(blob, UUID.randomUUID().toString(), "locked", timeToLive.toMillis());
         }
 
-        String uuid = contentMap.get("uuid");
+        String uuid = content.get("uuid");
 
         // already locked check whether lock has expired according to its defined ttl
-        String existingTimeToLive = contentMap.get("time-to-live");
+        String existingTimeToLive = content.get("time-to-live");
         if (existingTimeToLive == null) {
             LOG.warn("Failed to acquire lock, existing lock has no expiry set: {}", uuid);
             return false;
@@ -160,14 +130,47 @@ public class GCSMutex implements Lock {
         return false;
     }
 
-    boolean updateMutexThroughDataOverwrite(Blob blob, String uuid, String status, long ttlMs) throws GCSMutexException {
+    Map<String, String> readMutexContent(Blob blob) throws GCSMutexException {
+        if (blob.getSize() > 1024) {
+            throw new IllegalStateException(String.format("blob size > 1024 bytes; blobId %s", blob.getBlobId()));
+        }
+        byte[] array = new byte[blob.getSize().intValue()];
+        try (ReadChannel reader = blob.reader()) {
+            ByteBuffer bb = ByteBuffer.wrap(array);
+            int n;
+            while ((n = reader.read(bb)) != -1) {
+                Thread.sleep(100); // avoid excessive cpu usage when socket read is not yet ready
+            }
+        } catch (IOException | InterruptedException e) {
+            throw new GCSMutexException(e);
+        }
+        Pattern pattern = Pattern.compile("\\s*([^\\s:]+):\\s*([^\\s]*)\\s*");
+        return new String(array, StandardCharsets.UTF_8).lines().collect(Collectors.toMap(
+                line -> {
+                    Matcher m = pattern.matcher(line);
+                    if (!m.matches()) {
+                        throw new IllegalStateException("Line does not match pattern. Line: " + line);
+                    }
+                    return m.group(1);
+                },
+                line -> {
+                    Matcher m = pattern.matcher(line);
+                    if (!m.matches()) {
+                        throw new IllegalStateException("Line does not match pattern. Line: " + line);
+                    }
+                    return m.group(2);
+                }
+                )
+        );
+    }
+
+    boolean updateMutexThroughDataOverwrite(BlobInfo blobInfo, String uuid, String status, long ttlMs) throws GCSMutexException {
         try {
-            writeBytesToBlobIfGenerationMatch(blob, uuid, status, ttlMs);
+            writeBytesToBlobIfGenerationMatch(blobInfo, uuid, status, ttlMs);
             LOG.trace("Lock acquired. UUID: {}", uuid);
             return true;
         } catch (StorageException e) {
-            if ("Precondition Failed".equals(e.getMessage())
-                    && "conditionNotMet".equals(e.getReason())) {
+            if (e.getCode() == 412) {
                 LOG.trace("Failed to acquire lock, lost race to another competing process");
                 return false;
             } else {
@@ -176,13 +179,13 @@ public class GCSMutex implements Lock {
         }
     }
 
-    void writeBytesToBlobIfGenerationMatch(Blob blob, String uuid, String status, long ttlMs) throws GCSMutexException {
+    private void writeBytesToBlobIfGenerationMatch(BlobInfo blobInfo, String uuid, String status, long ttlMs) throws GCSMutexException {
         StringBuilder sb = new StringBuilder();
         sb.append("uuid: ").append(uuid).append("\n");
         sb.append("status: ").append(status).append("\n");
         sb.append("time-to-live: ").append(ttlMs).append("\n");
         ByteBuffer bb = ByteBuffer.wrap(sb.toString().getBytes(StandardCharsets.UTF_8));
-        try (WriteChannel ch = storage.writer(blob.toBuilder().build(), Storage.BlobWriteOption.generationMatch())) {
+        try (WriteChannel ch = storage.writer(blobInfo.toBuilder().build(), Storage.BlobWriteOption.generationMatch())) {
             ch.setChunkSize(1024);
             int i = 0;
             while (bb.hasRemaining()) {
@@ -220,8 +223,7 @@ public class GCSMutex implements Lock {
             LOG.trace("Lock acquired. UUID: {}", uuid);
             return true;
         } catch (StorageException e) {
-            if ("Precondition Failed".equals(e.getMessage())
-                    && "conditionNotMet".equals(e.getReason())) {
+            if (e.getCode() == 412) {
                 LOG.trace("lost creation race to another parallel process");
                 return false;
             } else {
