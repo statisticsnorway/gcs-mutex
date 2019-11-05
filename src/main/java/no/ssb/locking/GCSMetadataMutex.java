@@ -89,7 +89,7 @@ public class GCSMetadataMutex implements Lock {
     }
 
     long computeBackoffWaitTimeMs(long i) {
-        return Math.min(1000 * (1 << Math.min(i, 8)), maximumBackoff.toMillis()) + backoffRandom.nextInt(1001);
+        return Math.min(1000L * (1 << Math.min(i, 8)), maximumBackoff.toMillis()) + backoffRandom.nextInt(1001);
     }
 
     boolean tryAcquire() {
@@ -134,7 +134,7 @@ public class GCSMetadataMutex implements Lock {
                     Storage.BlobTargetOption.generationMatch(),
                     Storage.BlobTargetOption.metagenerationMatch()
             );
-            LOG.trace("Lock acquired. UUID: " + uuid);
+            LOG.trace("Lock acquired. UUID: {}", uuid);
             return true;
         } catch (StorageException e) {
             if ("Precondition Failed".equals(e.getMessage())
@@ -159,7 +159,7 @@ public class GCSMetadataMutex implements Lock {
             storage.create(BlobInfo.newBuilder(mutexBlobId).setMetadata(metadata).build(),
                     Storage.BlobTargetOption.doesNotExist()
             );
-            LOG.trace("Lock acquired. UUID: " + uuid);
+            LOG.trace("Lock acquired. UUID: {}", uuid);
             return true;
         } catch (StorageException e) {
             if ("Precondition Failed".equals(e.getMessage())

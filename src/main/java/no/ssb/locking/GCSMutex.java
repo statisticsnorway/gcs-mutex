@@ -20,10 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
-import java.util.Arrays;
-import java.util.Map;
-import java.util.Random;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
@@ -74,7 +71,7 @@ public class GCSMutex implements Lock {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-        GoogleCredentials scopedCredentials = sourceCredentials.createScoped(Arrays.asList("https://www.googleapis.com/auth/devstorage.read_write"));
+        GoogleCredentials scopedCredentials = sourceCredentials.createScoped(Collections.singletonList("https://www.googleapis.com/auth/devstorage.read_write"));
         Storage storage = StorageOptions.newBuilder().setCredentials(scopedCredentials).build().getService();
         return storage;
     }
@@ -94,7 +91,7 @@ public class GCSMutex implements Lock {
     }
 
     long computeBackoffWaitTimeMs(long i) {
-        return Math.min(1000 * (1 << Math.min(i, 8)), maximumBackoff.toMillis()) + backoffRandom.nextInt(1001);
+        return Math.min(1000 * (1L << Math.min(i, 8)), maximumBackoff.toMillis()) + backoffRandom.nextInt(1001);
     }
 
     boolean tryAcquire() {
@@ -103,7 +100,7 @@ public class GCSMutex implements Lock {
             return acquireByCreatingFileIfDoesNotExist(UUID.randomUUID().toString(), "locked", timeToLive.toMillis());
         }
         if (blob.getSize() > 1024) {
-            throw new RuntimeException("Lock content too large, cannot exceed 1024 bytes.");
+            throw new IllegalStateException(String.format("blob size > 1024 bytes; blobId %s", blob.getBlobId()));
         }
         byte[] array = new byte[blob.getSize().intValue()];
         try (ReadChannel reader = blob.reader()) {
@@ -120,14 +117,14 @@ public class GCSMutex implements Lock {
                 line -> {
                     Matcher m = pattern.matcher(line);
                     if (!m.matches()) {
-                        throw new RuntimeException("Line does not match pattern. Line: " + line);
+                        throw new IllegalStateException("Line does not match pattern. Line: " + line);
                     }
                     return m.group(1);
                 },
                 line -> {
                     Matcher m = pattern.matcher(line);
                     if (!m.matches()) {
-                        throw new RuntimeException("Line does not match pattern. Line: " + line);
+                        throw new IllegalStateException("Line does not match pattern. Line: " + line);
                     }
                     return m.group(2);
                 }
@@ -163,7 +160,7 @@ public class GCSMutex implements Lock {
     boolean updateMutexThroughDataOverwrite(Blob blob, String uuid, String status, long ttlMs) {
         try {
             writeBytesToBlobIfGenerationMatch(blob, uuid, status, ttlMs);
-            LOG.trace("Lock acquired. UUID: " + uuid);
+            LOG.trace("Lock acquired. UUID: {}", uuid);
             return true;
         } catch (StorageException e) {
             if ("Precondition Failed".equals(e.getMessage())
@@ -187,13 +184,14 @@ public class GCSMutex implements Lock {
             int i = 0;
             while (bb.hasRemaining()) {
                 if (i >= 25) {
-                    throw new RuntimeException("Unable to write data to GCS object");
+                    throw new RuntimeException("Unable to write data to GCS object after 25 attempts");
                 }
                 if ((i + 1) % 2 == 0) {
                     // avoid excessive cpu usage while retrying socket write
                     try {
                         Thread.sleep(1000);
                     } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt(); // preserve interrupt status
                         throw new RuntimeException(e);
                     }
                 }
@@ -216,7 +214,7 @@ public class GCSMutex implements Lock {
                     sb.toString().getBytes(StandardCharsets.UTF_8),
                     Storage.BlobTargetOption.doesNotExist()
             );
-            LOG.trace("Lock acquired. UUID: " + uuid);
+            LOG.trace("Lock acquired. UUID: {}", uuid);
             return true;
         } catch (StorageException e) {
             if ("Precondition Failed".equals(e.getMessage())
@@ -299,7 +297,7 @@ public class GCSMutex implements Lock {
         }
         String uuid = UUID.randomUUID().toString();
         writeBytesToBlobIfGenerationMatch(blob, uuid, "unlocked", timeToLive.toMillis());
-        LOG.trace("Unlocked. UUID: " + uuid);
+        LOG.trace("Unlocked. UUID: {}", uuid);
     }
 
     @Override
