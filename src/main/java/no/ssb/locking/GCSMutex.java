@@ -2,6 +2,8 @@ package no.ssb.locking;
 
 import com.google.auth.oauth2.GoogleCredentials;
 import com.google.auth.oauth2.ServiceAccountCredentials;
+import com.google.cloud.ReadChannel;
+import com.google.cloud.WriteChannel;
 import com.google.cloud.storage.Blob;
 import com.google.cloud.storage.BlobId;
 import com.google.cloud.storage.BlobInfo;
@@ -12,6 +14,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -23,7 +27,18 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
+/**
+ * This class implements mutual-exclusion through GCS object-data and preconditions. Although this class implements the
+ * java.util.concurrent.Lock interface, this class will not ensure any happens-before thread-safety effects.
+ * Due to limitations of if-generation-match:0 precondition, see https://cloud.google.com/storage/docs/generations-preconditions
+ * it could be unsafe to delete the file in order to implement the unlock operation.
+ * <p>
+ * This object-data based mutex requires read-write object access to the relevant object in the bucket.
+ */
 public class GCSMutex implements Lock {
 
     private final static Logger LOG = LoggerFactory.getLogger(GCSMutex.class);
@@ -59,7 +74,7 @@ public class GCSMutex implements Lock {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
-        GoogleCredentials scopedCredentials = sourceCredentials.createScoped(Arrays.asList("https://www.googleapis.com/auth/devstorage.full_control"));
+        GoogleCredentials scopedCredentials = sourceCredentials.createScoped(Arrays.asList("https://www.googleapis.com/auth/devstorage.read_write"));
         Storage storage = StorageOptions.newBuilder().setCredentials(scopedCredentials).build().getService();
         return storage;
     }
@@ -82,22 +97,55 @@ public class GCSMutex implements Lock {
         return Math.min(1000 * (1 << Math.min(i, 8)), maximumBackoff.toMillis()) + backoffRandom.nextInt(1001);
     }
 
-    private boolean tryAcquire() {
+    boolean tryAcquire() {
         Blob blob = storage.get(mutexBlobId);
         if (blob == null) {
-            return acquireByCreatingFileIfDoesNotExist();
+            return acquireByCreatingFileIfDoesNotExist(UUID.randomUUID().toString(), "locked", timeToLive.toMillis());
         }
-        Map<String, String> metadata = blob.getMetadata();
-        String status = metadata.get("status");
+        if (blob.getSize() > 1024) {
+            throw new RuntimeException("Lock content too large, cannot exceed 1024 bytes.");
+        }
+        byte[] array = new byte[blob.getSize().intValue()];
+        try (ReadChannel reader = blob.reader()) {
+            ByteBuffer bb = ByteBuffer.wrap(array);
+            int n;
+            while ((n = reader.read(bb)) != -1) {
+                Thread.sleep(100); // avoid excessive cpu usage when socket read is not yet ready
+            }
+        } catch (IOException | InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+        Pattern pattern = Pattern.compile("\\s*([^\\s:]+):\\s*([^\\s]*)\\s*");
+        Map<String, String> contentMap = new String(array, StandardCharsets.UTF_8).lines().collect(Collectors.toMap(
+                line -> {
+                    Matcher m = pattern.matcher(line);
+                    if (!m.matches()) {
+                        throw new RuntimeException("Line does not match pattern. Line: " + line);
+                    }
+                    return m.group(1);
+                },
+                line -> {
+                    Matcher m = pattern.matcher(line);
+                    if (!m.matches()) {
+                        throw new RuntimeException("Line does not match pattern. Line: " + line);
+                    }
+                    return m.group(2);
+                }
+                )
+        );
+
+        String status = contentMap.get("status");
         if (!"locked".equalsIgnoreCase(status)) {
             LOG.trace("Mutex available, attempting to acquire lock...");
-            return acquireThroughMetadataUpdate(blob);
+            return updateMutexThroughDataOverwrite(blob, UUID.randomUUID().toString(), "locked", timeToLive.toMillis());
         }
 
+        String uuid = contentMap.get("uuid");
+
         // already locked check whether lock has expired according to its defined ttl
-        String existingTimeToLive = metadata.get("time-to-live");
+        String existingTimeToLive = contentMap.get("time-to-live");
         if (existingTimeToLive == null) {
-            LOG.warn("Failed to acquire lock, existing lock has no expiry set: {}", metadata.get("uuid"));
+            LOG.warn("Failed to acquire lock, existing lock has no expiry set: {}", uuid);
             return false;
         }
         long ettl = Long.parseLong(existingTimeToLive);
@@ -106,24 +154,15 @@ public class GCSMutex implements Lock {
         long expiredDuration = System.currentTimeMillis() - expiry;
         if (expiredDuration >= 0) {
             LOG.trace("Mutex expired, attempting to acquire lock...");
-            return acquireThroughMetadataUpdate(blob);
+            return updateMutexThroughDataOverwrite(blob, UUID.randomUUID().toString(), "locked", timeToLive.toMillis());
         }
-        LOG.trace("Failed to acquire lock, already held by someone else with uuid: {} and ttl: {}", metadata.get("uuid"), metadata.get("time-to-live"));
+        LOG.trace("Failed to acquire lock, already held by someone else with uuid: {} and ttl: {}", uuid, ettl);
         return false;
     }
 
-    private boolean acquireThroughMetadataUpdate(Blob blob) {
-        String uuid = UUID.randomUUID().toString();
-        Map<String, String> m = Map.of(
-                "uuid", uuid,
-                "status", "locked",
-                "time-to-live", String.valueOf(timeToLive.toMillis())
-        );
+    boolean updateMutexThroughDataOverwrite(Blob blob, String uuid, String status, long ttlMs) {
         try {
-            storage.update(blob.toBuilder().setMetadata(m).build(),
-                    Storage.BlobTargetOption.generationMatch(),
-                    Storage.BlobTargetOption.metagenerationMatch()
-            );
+            writeBytesToBlobIfGenerationMatch(blob, uuid, status, ttlMs);
             LOG.trace("Lock acquired. UUID: " + uuid);
             return true;
         } catch (StorageException e) {
@@ -137,16 +176,44 @@ public class GCSMutex implements Lock {
         }
     }
 
-    private boolean acquireByCreatingFileIfDoesNotExist() {
+    void writeBytesToBlobIfGenerationMatch(Blob blob, String uuid, String status, long ttlMs) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("uuid: ").append(uuid).append("\n");
+        sb.append("status: ").append(status).append("\n");
+        sb.append("time-to-live: ").append(ttlMs).append("\n");
+        ByteBuffer bb = ByteBuffer.wrap(sb.toString().getBytes(StandardCharsets.UTF_8));
+        try (WriteChannel ch = storage.writer(blob.toBuilder().build(), Storage.BlobWriteOption.generationMatch())) {
+            ch.setChunkSize(1024);
+            int i = 0;
+            while (bb.hasRemaining()) {
+                if (i >= 25) {
+                    throw new RuntimeException("Unable to write data to GCS object");
+                }
+                if ((i + 1) % 2 == 0) {
+                    // avoid excessive cpu usage while retrying socket write
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+                int n = ch.write(bb);
+                i++;
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    boolean acquireByCreatingFileIfDoesNotExist(String uuid, String status, long ttlMs) {
         // lock-file does not exist
-        String uuid = UUID.randomUUID().toString();
-        Map<String, String> metadata = Map.of(
-                "uuid", uuid,
-                "status", "locked",
-                "time-to-live", String.valueOf(timeToLive.toMillis())
-        );
+        StringBuilder sb = new StringBuilder();
+        sb.append("uuid: ").append(uuid).append("\n");
+        sb.append("status: ").append(status).append("\n");
+        sb.append("time-to-live: ").append(ttlMs).append("\n");
         try {
-            storage.create(BlobInfo.newBuilder(mutexBlobId).setMetadata(metadata).build(),
+            storage.create(BlobInfo.newBuilder(mutexBlobId).build(),
+                    sb.toString().getBytes(StandardCharsets.UTF_8),
                     Storage.BlobTargetOption.doesNotExist()
             );
             LOG.trace("Lock acquired. UUID: " + uuid);
@@ -227,14 +294,11 @@ public class GCSMutex implements Lock {
         LOG.trace("unlock()");
         Blob blob = storage.get(mutexBlobId);
         if (blob == null) {
-            return; // no blob means already unlocked
+            LOG.trace("No blob, already unlocked");
+            return;
         }
         String uuid = UUID.randomUUID().toString();
-        Map<String, String> m = Map.of(
-                "uuid", uuid,
-                "status", "open"
-        );
-        storage.update(blob.toBuilder().setMetadata(m).build());
+        writeBytesToBlobIfGenerationMatch(blob, uuid, "unlocked", timeToLive.toMillis());
         LOG.trace("Unlocked. UUID: " + uuid);
     }
 
