@@ -25,7 +25,7 @@ public class GCSMutexTest {
     public void setup() {
         Path pathToGcsSaKeyFile = Path.of(ofNullable(System.getenv("GCS_MUTEX_SERVICE_ACCOUNT_KEY_FILE")).orElse("secret/gcs_sa.json"));
         storage = GCSMutex.storageFrom(pathToGcsSaKeyFile);
-        bucket = ofNullable(System.getenv("GCS_MUTEX_BUCKET")).orElse("dev-datalager-store");
+        bucket = ofNullable(System.getenv("GCS_MUTEX_BUCKET")).orElse("bip-drone-dependency-cache");
         blobId = BlobId.of(bucket, "testng/mutex-" + UUID.randomUUID().toString() + ".dat");
         mutex = GCSMutex.create(storage, blobId);
     }
